@@ -64,6 +64,14 @@ ETCD_CPP_REPO = "https://github.com/etcd-cpp-apiv3/etcd-cpp-apiv3.git"
 PROTOBUF_VER = "v21.12"
 GRPC_VER = "v1.46.7"
 
+# Non-root fallback paths (used when /usr/local is not writable)
+NONROOT_PREFIX = "/tmp/local"
+NONROOT_BIN = "/tmp/.local/bin"
+NONROOT_NIXL_PREFIX = "/tmp/local/nixl"
+NONROOT_NIXLBENCH_PREFIX = "/tmp/nixlbench"
+NIXL_PIP_LIBS = "/usr/local/lib/python3.12/dist-packages/.nixl_cu12.mesonpy.libs"
+NIXL_PIP_UCX_LIBS = "/usr/local/lib/python3.12/dist-packages/nixl_cu12.libs"
+
 # Defaults — overridden via configure() from run-tests.py
 NIXLBENCH_BACKEND = "UCX"
 NIXLBENCH_SEG_TYPE = "VRAM"
@@ -71,21 +79,79 @@ NIXLBENCH_BUFFER_SIZE = "8G"
 
 
 # ---------------------------------------------------------------------------
+# Non-root environment detection and helpers
+# ---------------------------------------------------------------------------
+_nonroot_cache = {}  # pod_name -> bool
+
+
+def _detect_nonroot(pod_name):
+    """Detect if a pod runs as non-root (cannot write to /usr/local/bin)."""
+    if pod_name in _nonroot_cache:
+        return _nonroot_cache[pod_name]
+    result = exec_in_pod(
+        pod_name,
+        ["bash", "-c",
+         "touch /usr/local/bin/.test_write 2>/dev/null "
+         "&& rm -f /usr/local/bin/.test_write && echo ROOT || echo NONROOT"],
+        use_debug=False,
+    )
+    is_nonroot = "NONROOT" in (result.stdout or "")
+    _nonroot_cache[pod_name] = is_nonroot
+    return is_nonroot
+
+
+def _nonroot_env_prefix(pod_name):
+    """Build shell env prefix for non-root pods (HOME=/tmp, /tmp paths)."""
+    if not _detect_nonroot(pod_name):
+        return ""
+    return (
+        f'export HOME=/tmp && '
+        f'export PATH={NONROOT_BIN}:{NONROOT_NIXLBENCH_PREFIX}/bin:'
+        f'{NONROOT_NIXL_PREFIX}/bin:{NONROOT_PREFIX}/bin:$PATH && '
+        f'export LD_LIBRARY_PATH={NONROOT_NIXLBENCH_PREFIX}/lib:'
+        f'{NONROOT_NIXLBENCH_PREFIX}/lib64:'
+        f'{NONROOT_NIXL_PREFIX}/lib64:{NONROOT_NIXL_PREFIX}/lib64/plugins:'
+        f'{NONROOT_NIXL_PREFIX}/lib/$(uname -m)-linux-gnu:'
+        f'{NONROOT_NIXL_PREFIX}/lib/$(uname -m)-linux-gnu/plugins:'
+        f'{NONROOT_PREFIX}/lib64:{NONROOT_PREFIX}/lib:'
+        f'{NIXL_PIP_LIBS}:{NIXL_PIP_UCX_LIBS}:'
+        f'/usr/local/lib64:/usr/local/lib:${{LD_LIBRARY_PATH:-}} && '
+        f'export PKG_CONFIG_PATH={NONROOT_PREFIX}/lib64/pkgconfig:'
+        f'{NONROOT_PREFIX}/lib/pkgconfig:${{PKG_CONFIG_PATH:-}} && '
+    )
+
+
+def _get_install_prefix(pod_name):
+    """Return (nixl_prefix, nixlbench_prefix, local_prefix) based on root detection."""
+    if _detect_nonroot(pod_name):
+        return NONROOT_NIXL_PREFIX, NONROOT_NIXLBENCH_PREFIX, NONROOT_PREFIX
+    return NIXL_INSTALL_PREFIX, NIXLBENCH_INSTALL_PREFIX, "/usr/local"
+
+
+def _get_bin_dir(pod_name):
+    """Return the bin directory for installing standalone tools (etcd, git)."""
+    if _detect_nonroot(pod_name):
+        return NONROOT_BIN
+    return "/usr/local/bin"
+
+
+# ---------------------------------------------------------------------------
 # Binary checks
 # ---------------------------------------------------------------------------
 def _check_binary(pod_name, binary):
     """Check if a binary is available on a pod. Returns True if found."""
-    # Include nixlbench install paths in case it was built from source
-    # For nixlbench, also verify shared libraries can load (ldd check)
+    nixl_pfx, bench_pfx, _local_pfx = _get_install_prefix(pod_name)
+    nonroot_pfx = _nonroot_env_prefix(pod_name)
     env_prefix = (
-        f'export PATH={NIXLBENCH_INSTALL_PREFIX}/bin:{NIXL_INSTALL_PREFIX}/bin:'
-        f'/usr/local/bin:$PATH && '
-        f'export LD_LIBRARY_PATH={NIXLBENCH_INSTALL_PREFIX}/lib:'
-        f'{NIXLBENCH_INSTALL_PREFIX}/lib64:'
-        f'{NIXL_INSTALL_PREFIX}/lib64:'
-        f'{NIXL_INSTALL_PREFIX}/lib64/plugins:'
-        f'{NIXL_INSTALL_PREFIX}/lib/$(uname -m)-linux-gnu:'
-        f'{NIXL_INSTALL_PREFIX}/lib/$(uname -m)-linux-gnu/plugins:'
+        f'{nonroot_pfx}'
+        f'export PATH={bench_pfx}/bin:{nixl_pfx}/bin:'
+        f'{NONROOT_BIN}:/usr/local/bin:$PATH && '
+        f'export LD_LIBRARY_PATH={bench_pfx}/lib:'
+        f'{bench_pfx}/lib64:'
+        f'{nixl_pfx}/lib64:{nixl_pfx}/lib64/plugins:'
+        f'{nixl_pfx}/lib/$(uname -m)-linux-gnu:'
+        f'{nixl_pfx}/lib/$(uname -m)-linux-gnu/plugins:'
+        f'{NIXL_PIP_LIBS}:{NIXL_PIP_UCX_LIBS}:'
         f'/opt/ucx/lib:/usr/local/lib64:/usr/local/lib:${{LD_LIBRARY_PATH:-}}'
     )
     if binary == NIXLBENCH_BINARY:
@@ -113,12 +179,16 @@ def _check_binary(pod_name, binary):
 
 def _check_etcd_runtime(pod_name):
     """Check if nixlbench was built with ETCD runtime support."""
+    nixl_pfx, bench_pfx, _local_pfx = _get_install_prefix(pod_name)
+    nonroot_pfx = _nonroot_env_prefix(pod_name)
     env_prefix = (
-        f'export PATH={NIXLBENCH_INSTALL_PREFIX}/bin:{NIXL_INSTALL_PREFIX}/bin:'
-        f'/usr/local/bin:$PATH && '
-        f'export LD_LIBRARY_PATH={NIXLBENCH_INSTALL_PREFIX}/lib:'
-        f'{NIXLBENCH_INSTALL_PREFIX}/lib64:'
-        f'{NIXL_INSTALL_PREFIX}/lib64:{NIXL_INSTALL_PREFIX}/lib64/plugins:'
+        f'{nonroot_pfx}'
+        f'export PATH={bench_pfx}/bin:{nixl_pfx}/bin:'
+        f'{NONROOT_BIN}:/usr/local/bin:$PATH && '
+        f'export LD_LIBRARY_PATH={bench_pfx}/lib:'
+        f'{bench_pfx}/lib64:'
+        f'{nixl_pfx}/lib64:{nixl_pfx}/lib64/plugins:'
+        f'{NIXL_PIP_LIBS}:{NIXL_PIP_UCX_LIBS}:'
         f'/opt/ucx/lib:/usr/local/lib64:/usr/local/lib:${{LD_LIBRARY_PATH:-}}'
     )
     # Run nixlbench with --etcd_endpoints dummy to check if ETCD runtime is valid
@@ -138,16 +208,11 @@ def ensure_nixlbench(pod_name, out=None):
     """Verify nixlbench binary is available; build from source if --install-deps."""
     _out = out or print
     if _check_binary(pod_name, NIXLBENCH_BINARY):
-        # Also verify ETCD runtime is available
-        if _check_etcd_runtime(pod_name):
+        if _check_etcd_in_binary(pod_name):
             _out(f"  nixlbench binary available on {pod_name} (with ETCD runtime).")
-            return
-        elif _get_common().INSTALL_DEPS:
-            _out(f"  nixlbench found but lacks ETCD runtime on {pod_name}, rebuilding ...")
         else:
-            _out(f"  Warning: nixlbench on {pod_name} lacks ETCD runtime.")
-            _out(f"  Re-run with --install-deps (-i) to rebuild with ETCD support.")
-            sys.exit(1)
+            _out(f"  nixlbench binary available on {pod_name} (ASIO runtime, no ETCD).")
+        return
     if not _get_common().INSTALL_DEPS:
         _out(f"  Error: nixlbench binary not found on {pod_name}.")
         _out(f"  Re-run with --install-deps (-i) to build from source,")
@@ -171,11 +236,12 @@ def _run_build_step(pod_name, cmd, label, out, timeout=600, ignore_error=False):
     """Run a build step inside the pod. Returns True on success."""
     _out = out or print
     _out(f"    [{label}] ...")
-    # Ensure /usr/local/bin is on PATH (pip installs meson/ninja there)
-    # Also set PKG_CONFIG_PATH for locally-built libraries
+    nonroot_pfx = _nonroot_env_prefix(pod_name)
+    _nixl_pfx, _bench_pfx, local_pfx = _get_install_prefix(pod_name)
     cmd_with_path = (
-        f'export PATH=/usr/local/bin:$PATH && '
-        f'export PKG_CONFIG_PATH=/usr/local/lib64/pkgconfig:/usr/local/lib/pkgconfig:${{PKG_CONFIG_PATH:-}} && '
+        f'{nonroot_pfx}'
+        f'export PATH={NONROOT_BIN}:/usr/local/bin:$PATH && '
+        f'export PKG_CONFIG_PATH={local_pfx}/lib64/pkgconfig:{local_pfx}/lib/pkgconfig:${{PKG_CONFIG_PATH:-}} && '
         f'{cmd}'
     )
     result = exec_in_pod(pod_name, ["bash", "-c", cmd_with_path], timeout=timeout, use_debug=False)
@@ -193,15 +259,85 @@ def _run_build_step(pod_name, cmd, label, out, timeout=600, ignore_error=False):
     return True
 
 
+def _install_deps_nonroot(pod_name, out=None):
+    """Install build dependencies for non-root pods using pip and curl."""
+    _out = out or print
+    _out(f"  Detected non-root environment on {pod_name}")
+    _out(f"  Installing build tools via pip to /tmp/.local/bin ...")
+
+    # Python build tools via HOME=/tmp pip install --user
+    pip_pkgs = "meson pybind11 tomlkit cmake pkgconf"
+    result = exec_in_pod(
+        pod_name,
+        ["bash", "-c",
+         f"export HOME=/tmp && "
+         f"pip install --user {pip_pkgs} 2>&1 || "
+         f"pip3 install --user {pip_pkgs} 2>&1 || "
+         f"python3 -m pip install --user {pip_pkgs} 2>&1"],
+        timeout=180, use_debug=False,
+    )
+    if result.returncode != 0:
+        _out(f"    Warning: pip install failed: {(result.stderr or result.stdout or '').strip()[:300]}")
+    else:
+        _out(f"    Installed Python build tools (meson, cmake, pybind11).")
+
+    # Verify pkg-config is available (installed via pkgconf above)
+    result = exec_in_pod(
+        pod_name,
+        ["bash", "-c",
+         f"export HOME=/tmp && export PATH={NONROOT_BIN}:$PATH && "
+         f"command -v pkg-config >/dev/null 2>&1 && echo OK || echo MISSING"],
+        timeout=30, use_debug=False,
+    )
+    if "OK" in (result.stdout or ""):
+        _out(f"    pkg-config available at {NONROOT_BIN}/pkg-config")
+    else:
+        _out(f"    Warning: pkg-config not found on PATH")
+
+    # Check for git — download static binary if missing
+    git_check = exec_in_pod(
+        pod_name,
+        ["bash", "-c", f"export PATH={NONROOT_BIN}:$PATH && command -v git"],
+        use_debug=False,
+    )
+    if git_check.returncode != 0:
+        _out(f"    git not found; will use curl for tarball downloads.")
+
+    # Ensure /tmp/.local/bin and build dirs exist
+    exec_in_pod(
+        pod_name,
+        ["bash", "-c", f"mkdir -p {NONROOT_BIN} {NONROOT_PREFIX} {NIXL_BUILD_DIR}"],
+        use_debug=False,
+    )
+
+    # Verify essential tools
+    verify_cmd = (
+        f"export HOME=/tmp && export PATH={NONROOT_BIN}:/usr/local/bin:$PATH && "
+        f"echo 'meson:' $(meson --version 2>/dev/null || echo MISSING) && "
+        f"echo 'cmake:' $(cmake --version 2>/dev/null | head -1 || echo MISSING) && "
+        f"echo 'ninja:' $(ninja --version 2>/dev/null || echo MISSING) && "
+        f"echo 'gcc:' $(gcc --version 2>/dev/null | head -1 || echo MISSING)"
+    )
+    result = exec_in_pod(pod_name, ["bash", "-c", verify_cmd], use_debug=False)
+    if result.stdout:
+        for line in result.stdout.strip().split("\n"):
+            _out(f"    {line}")
+
+    _out(f"  Build dependencies ready on {pod_name}.")
+    return True
+
+
 def install_nixlbench_deps(pod_name, out=None):
     """Install system packages and Python build tools needed for nixlbench."""
     _out = out or print
     _out(f"  Installing build dependencies on {pod_name} ...")
 
+    # Non-root path: skip apt-get/dnf entirely, use pip + curl
+    if _detect_nonroot(pod_name):
+        return _install_deps_nonroot(pod_name, out=_out)
+
     # Package groups by distro family — installed one group at a time so a
     # failure in one doesn't block the rest.
-    # Install each package individually to avoid one missing package
-    # blocking the rest.  RHEL 9 UBI repos have limited -devel packages.
     rpm_groups = [
         ("gcc gcc-c++ ninja-build cmake pkgconfig git python3-pip",
          "core build tools"),
@@ -307,30 +443,66 @@ def _clean_build_dir(pod_name, build_dir, out):
     )
 
 
+def _clone_or_download(pod_name, repo_url, branch_or_tag, dest_dir, out):
+    """Clone a git repo, or fall back to curl tarball download if git is unavailable."""
+    _out = out or print
+    # In non-root mode we install a git stub (for meson version queries only),
+    # so always use curl for actual cloning in that case.
+    use_git = False
+    if not _detect_nonroot(pod_name):
+        git_check = exec_in_pod(
+            pod_name,
+            ["bash", "-c", f"export PATH={NONROOT_BIN}:$PATH && "
+             f"git --version 2>/dev/null | grep -q 'git version'"],
+            use_debug=False,
+        )
+        use_git = git_check.returncode == 0
+    if use_git:
+        return f"git clone --depth 1 --branch {branch_or_tag} {repo_url} {dest_dir}"
+    # Fallback: download tarball via curl (try tag first, then branch)
+    base_url = repo_url.replace(".git", "")
+    return (
+        f"mkdir -p {dest_dir} && "
+        f"(curl -sfL {base_url}/archive/refs/tags/{branch_or_tag}.tar.gz -o /tmp/_dl.tar.gz "
+        f"|| curl -sfL {base_url}/archive/refs/heads/{branch_or_tag}.tar.gz -o /tmp/_dl.tar.gz "
+        f"|| curl -sfL {base_url}/archive/{branch_or_tag}.tar.gz -o /tmp/_dl.tar.gz) && "
+        f"tar xzf /tmp/_dl.tar.gz --strip-components=1 -C {dest_dir} && "
+        f"rm -f /tmp/_dl.tar.gz"
+    )
+
+
 def build_protobuf(pod_name, out=None):
     """Build protobuf from source (required by gRPC and etcd-cpp-apiv3)."""
     _out = out or print
+    _nixl_pfx, _bench_pfx, local_pfx = _get_install_prefix(pod_name)
+    nonroot = _detect_nonroot(pod_name)
     if _check_lib_installed(pod_name, "protobuf",
-                            ["/usr/local/lib64/libprotobuf.so",
+                            [f"{local_pfx}/lib64/libprotobuf.so",
+                             f"{local_pfx}/lib/libprotobuf.so",
+                             "/usr/local/lib64/libprotobuf.so",
                              "/usr/local/lib/libprotobuf.so"]):
         _out(f"    protobuf already installed.")
         return True
     _out(f"  Building protobuf on {pod_name} ...")
     build_dir = f"{NIXL_BUILD_DIR}/protobuf"
     _clean_build_dir(pod_name, build_dir, _out)
+    clone_cmd = _clone_or_download(
+        pod_name, "https://github.com/protocolbuffers/protobuf.git",
+        PROTOBUF_VER, build_dir, _out)
+    install_cmd = f"cd {build_dir}/build && make install"
+    if not nonroot:
+        install_cmd += " && ldconfig"
     steps = [
-        (f"git clone --depth 1 --branch {PROTOBUF_VER} "
-         f"https://github.com/protocolbuffers/protobuf.git {build_dir}",
-         "clone protobuf", 120),
-        (f"cd {build_dir} && git submodule update --init --recursive",
+        (clone_cmd, "clone protobuf", 120),
+        (f"cd {build_dir} && git submodule update --init --recursive 2>/dev/null || true",
          "init submodules", 120),
         (f"mkdir -p {build_dir}/build && cd {build_dir}/build && "
-         f"cmake .. -DCMAKE_INSTALL_PREFIX=/usr/local "
+         f"cmake .. -DCMAKE_INSTALL_PREFIX={local_pfx} "
          f"-DCMAKE_POSITION_INDEPENDENT_CODE=ON "
          f"-Dprotobuf_BUILD_TESTS=OFF -DBUILD_SHARED_LIBS=ON",
          "cmake configure", 120),
         (f"cd {build_dir}/build && make -j$(nproc)", "build", 600),
-        (f"cd {build_dir}/build && make install && ldconfig", "install", 120),
+        (install_cmd, "install", 120),
     ]
     for cmd, label, t in steps:
         if not _run_build_step(pod_name, cmd, label, _out, timeout=t):
@@ -343,24 +515,31 @@ def build_protobuf(pod_name, out=None):
 def build_grpc(pod_name, out=None):
     """Build gRPC from source with bundled abseil (required by etcd-cpp-apiv3)."""
     _out = out or print
+    _nixl_pfx, _bench_pfx, local_pfx = _get_install_prefix(pod_name)
+    nonroot = _detect_nonroot(pod_name)
     if _check_lib_installed(pod_name, "grpc++",
-                            ["/usr/local/lib/libgrpc++.so",
+                            [f"{local_pfx}/lib/libgrpc++.so",
+                             f"{local_pfx}/lib64/libgrpc++.so",
+                             "/usr/local/lib/libgrpc++.so",
                              "/usr/local/lib64/libgrpc++.so"]):
         _out(f"    gRPC already installed.")
         return True
     _out(f"  Building gRPC on {pod_name} (this may take several minutes) ...")
     build_dir = f"{NIXL_BUILD_DIR}/grpc"
     _clean_build_dir(pod_name, build_dir, _out)
+    clone_cmd = _clone_or_download(
+        pod_name, "https://github.com/grpc/grpc.git",
+        GRPC_VER, build_dir, _out)
+    install_cmd = f"cd {build_dir}/build && cmake --install ."
+    if not nonroot:
+        install_cmd += " && ldconfig"
     steps = [
-        (f"git clone --depth 1 --branch {GRPC_VER} "
-         f"https://github.com/grpc/grpc.git {build_dir}",
-         "clone gRPC", 120),
-        # Init only needed submodules: abseil and c-ares
+        (clone_cmd, "clone gRPC", 120),
         (f"cd {build_dir} && git submodule update --init "
-         f"third_party/abseil-cpp third_party/cares/cares",
+         f"third_party/abseil-cpp third_party/cares/cares 2>/dev/null || true",
          "init submodules", 120),
         (f"mkdir -p {build_dir}/build && cd {build_dir}/build && "
-         f"cmake .. -DCMAKE_INSTALL_PREFIX=/usr/local "
+         f"cmake .. -DCMAKE_INSTALL_PREFIX={local_pfx} "
          f"-DBUILD_SHARED_LIBS=ON -DgRPC_INSTALL=ON "
          f"-DgRPC_BUILD_TESTS=OFF "
          f"-DgRPC_PROTOBUF_PROVIDER=package "
@@ -372,12 +551,9 @@ def build_grpc(pod_name, out=None):
          f"-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
          "cmake configure", 120),
         (f"cd {build_dir}/build && make -j$(nproc)", "build", 900),
-        (f"cd {build_dir}/build && cmake --install . && ldconfig", "install", 120),
-        # Remove gRPC's bundled abseil pkg-config files so they don't conflict
-        # with NIXL's meson subproject abseil (which is much newer).
-        # gRPC itself links abseil statically via its module provider.
-        (f"rm -f /usr/local/lib/pkgconfig/absl_*.pc "
-         f"/usr/local/lib64/pkgconfig/absl_*.pc 2>/dev/null; "
+        (install_cmd, "install", 120),
+        (f"rm -f {local_pfx}/lib/pkgconfig/absl_*.pc "
+         f"{local_pfx}/lib64/pkgconfig/absl_*.pc 2>/dev/null; "
          f"dnf remove -y abseil-cpp abseil-cpp-devel 2>/dev/null; true",
          "clean abseil pkg-config", 60),
     ]
@@ -396,10 +572,14 @@ def build_etcd_cpp_api(pod_name, out=None):
     if not already present (RHEL 9 UBI repos lack these C++ packages).
     """
     _out = out or print
+    _nixl_pfx, _bench_pfx, local_pfx = _get_install_prefix(pod_name)
+    nonroot = _detect_nonroot(pod_name)
 
     # Check if already installed
     if _check_lib_installed(pod_name, "etcd-cpp-api",
-                            ["/usr/local/lib64/libetcd-cpp-api-core.so",
+                            [f"{local_pfx}/lib64/libetcd-cpp-api-core.so",
+                             f"{local_pfx}/lib/libetcd-cpp-api-core.so",
+                             "/usr/local/lib64/libetcd-cpp-api-core.so",
                              "/usr/local/lib/libetcd-cpp-api-core.so"]):
         _out(f"    etcd-cpp-apiv3 already available.")
         return True
@@ -420,16 +600,21 @@ def build_etcd_cpp_api(pod_name, out=None):
     _out(f"  Building etcd-cpp-apiv3 on {pod_name} ...")
     build_dir = f"{NIXL_BUILD_DIR}/etcd-cpp-apiv3"
     _clean_build_dir(pod_name, build_dir, _out)
+    clone_cmd = _clone_or_download(
+        pod_name, "https://github.com/etcd-cpp-apiv3/etcd-cpp-apiv3.git",
+        "master", build_dir, _out)
+    install_cmd = f"cd {build_dir}/build && make install"
+    if not nonroot:
+        install_cmd += " && ldconfig"
     steps = [
-        (f"git clone --depth 1 {ETCD_CPP_REPO} {build_dir}",
-         "clone etcd-cpp-apiv3", 120),
+        (clone_cmd, "clone etcd-cpp-apiv3", 120),
         (f"mkdir -p {build_dir}/build && cd {build_dir}/build && "
-         f"cmake .. -DCMAKE_INSTALL_PREFIX=/usr/local -DBUILD_SHARED_LIBS=ON "
+         f"cmake .. -DCMAKE_INSTALL_PREFIX={local_pfx} -DBUILD_SHARED_LIBS=ON "
          f"-DBUILD_ETCD_TESTS=OFF -DBUILD_ETCD_CORE_ONLY=ON "
-         f"-DCMAKE_PREFIX_PATH=/usr/local",
+         f"-DCMAKE_PREFIX_PATH={local_pfx}",
          "cmake configure", 120),
         (f"cd {build_dir}/build && make -j$(nproc)", "build", 300),
-        (f"cd {build_dir}/build && make install && ldconfig", "install", 120),
+        (install_cmd, "install", 120),
     ]
     for cmd, label, t in steps:
         if not _run_build_step(pod_name, cmd, label, _out, timeout=t):
@@ -439,9 +624,9 @@ def build_etcd_cpp_api(pod_name, out=None):
 
     # Create pkg-config file (meson needs it to find etcd-cpp-api)
     pkgconfig_cmd = (
-        'mkdir -p /usr/local/lib64/pkgconfig && '
-        'cat > /usr/local/lib64/pkgconfig/etcd-cpp-api.pc << "PKGEOF"\n'
-        'prefix=/usr/local\n'
+        f'mkdir -p {local_pfx}/lib64/pkgconfig && '
+        f'cat > {local_pfx}/lib64/pkgconfig/etcd-cpp-api.pc << "PKGEOF"\n'
+        f'prefix={local_pfx}\n'
         'exec_prefix=${prefix}\n'
         'libdir=${prefix}/lib64\n'
         'includedir=${prefix}/include\n'
@@ -459,10 +644,73 @@ def build_etcd_cpp_api(pod_name, out=None):
     return True
 
 
+def _setup_ucx_prefix_from_pip(pod_name, out=None):
+    """Create a proper UCX prefix from pip package libs + downloaded headers.
+
+    The pip nixl_cu12 package bundles UCX runtime libs with versioned names.
+    This function creates a standard UCX prefix layout at NONROOT_PREFIX/ucx with:
+    - lib/libucp.so etc (symlinks to pip versioned libs)
+    - lib/ucx/ (symlink to pip ucx plugins dir)
+    - include/ucp/, include/ucs/, include/uct/ (downloaded from UCX release)
+    """
+    _out = out or print
+    ucx_pfx = f"{NONROOT_PREFIX}/ucx"
+    pip_ucx = NIXL_PIP_UCX_LIBS
+
+    # Create lib symlinks (versioned -> unversioned)
+    setup_cmd = (
+        f"mkdir -p {ucx_pfx}/lib {ucx_pfx}/include && "
+        f"for f in {pip_ucx}/libucp-*.so*; do ln -sf \"$f\" {ucx_pfx}/lib/libucp.so; done && "
+        f"for f in {pip_ucx}/libucs-*.so*; do ln -sf \"$f\" {ucx_pfx}/lib/libucs.so; done && "
+        f"for f in {pip_ucx}/libuct-*.so*; do ln -sf \"$f\" {ucx_pfx}/lib/libuct.so; done && "
+        f"for f in {pip_ucx}/libucm-*.so*; do ln -sf \"$f\" {ucx_pfx}/lib/libucm.so; done && "
+        f"ln -sfn {pip_ucx}/ucx {ucx_pfx}/lib/ucx && "
+        f"echo LIBS_OK"
+    )
+    result = exec_in_pod(pod_name, ["bash", "-c", setup_cmd], timeout=30, use_debug=False)
+    if "LIBS_OK" not in (result.stdout or ""):
+        _out(f"    Warning: failed to create UCX lib symlinks")
+        return None
+
+    # Download UCX headers from release tarball (just the src/ucp, src/ucs, src/uct include dirs)
+    # UCX 1.18.0 matches the bundled version (check via lib version)
+    headers_cmd = (
+        f"if [ ! -f {ucx_pfx}/include/ucp/api/ucp.h ]; then "
+        f"  curl -sfL https://github.com/openucx/ucx/releases/download/v1.18.0/ucx-1.18.0.tar.gz "
+        f"  -o /tmp/_ucx_headers.tar.gz && "
+        f"  tar xzf /tmp/_ucx_headers.tar.gz -C /tmp "
+        f"  ucx-1.18.0/src/ucp/api ucx-1.18.0/src/ucs/type "
+        f"  ucx-1.18.0/src/ucs/sys ucx-1.18.0/src/ucs/memory "
+        f"  ucx-1.18.0/src/ucs/config ucx-1.18.0/src/uct/api 2>/dev/null && "
+        f"  mkdir -p {ucx_pfx}/include/ucp/api {ucx_pfx}/include/ucs/type "
+        f"  {ucx_pfx}/include/ucs/sys {ucx_pfx}/include/ucs/memory "
+        f"  {ucx_pfx}/include/ucs/config {ucx_pfx}/include/uct/api && "
+        f"  cp /tmp/ucx-1.18.0/src/ucp/api/*.h {ucx_pfx}/include/ucp/api/ && "
+        f"  cp /tmp/ucx-1.18.0/src/ucs/type/*.h {ucx_pfx}/include/ucs/type/ && "
+        f"  cp /tmp/ucx-1.18.0/src/ucs/sys/*.h {ucx_pfx}/include/ucs/sys/ && "
+        f"  cp /tmp/ucx-1.18.0/src/ucs/memory/*.h {ucx_pfx}/include/ucs/memory/ && "
+        f"  cp /tmp/ucx-1.18.0/src/ucs/config/*.h {ucx_pfx}/include/ucs/config/ && "
+        f"  cp /tmp/ucx-1.18.0/src/uct/api/*.h {ucx_pfx}/include/uct/api/ && "
+        f"  rm -rf /tmp/ucx-1.18.0 /tmp/_ucx_headers.tar.gz && "
+        f"  echo HEADERS_OK; "
+        f"else echo HEADERS_OK; fi"
+    )
+    result = exec_in_pod(pod_name, ["bash", "-c", headers_cmd], timeout=120, use_debug=False)
+    if "HEADERS_OK" not in (result.stdout or ""):
+        _out(f"    Warning: failed to download UCX headers")
+        return None
+
+    _out(f"    UCX prefix set up at {ucx_pfx} (headers downloaded, libs from pip)")
+    return ucx_pfx
+
+
 def _detect_ucx_path(pod_name):
     """Detect UCX installation path on the pod."""
-    # Check common locations: /opt/ucx, /usr/local, /usr
-    for path in ["/opt/ucx", "/usr/local", "/usr"]:
+    # Check common locations including pip package bundled UCX
+    search_paths = ["/opt/ucx", "/usr/local", "/usr"]
+    if _detect_nonroot(pod_name):
+        search_paths = [f"{NONROOT_PREFIX}/ucx"] + search_paths
+    for path in search_paths:
         result = exec_in_pod(
             pod_name,
             ["bash", "-c", f"test -f {path}/lib/libucp.so && echo FOUND"],
@@ -470,16 +718,29 @@ def _detect_ucx_path(pod_name):
         )
         if result.returncode == 0 and "FOUND" in result.stdout:
             return path
+    # Check for UCX bundled in the NIXL pip package (versioned .so names)
+    result = exec_in_pod(
+        pod_name,
+        ["bash", "-c", f"ls {NIXL_PIP_UCX_LIBS}/libucp-*.so* 2>/dev/null && echo FOUND"],
+        use_debug=False,
+    )
+    if result.returncode == 0 and "FOUND" in result.stdout:
+        return NIXL_PIP_UCX_LIBS
     return None
 
 
 def build_nixl(pod_name, out=None):
     """Clone and build NIXL library from source (UCX plugin only)."""
     _out = out or print
+    nixl_pfx, _bench_pfx, local_pfx = _get_install_prefix(pod_name)
+    nonroot = _detect_nonroot(pod_name)
     _out(f"  Building NIXL library on {pod_name} ...")
 
     # Detect UCX path for meson
     ucx_path = _detect_ucx_path(pod_name)
+    if ucx_path == NIXL_PIP_UCX_LIBS and nonroot:
+        # pip UCX has versioned .so names and no headers — create a proper prefix
+        ucx_path = _setup_ucx_prefix_from_pip(pod_name, out=_out)
     if ucx_path:
         _out(f"    Found UCX at {ucx_path}")
     else:
@@ -487,7 +748,7 @@ def build_nixl(pod_name, out=None):
 
     nixl_src = f"{NIXL_BUILD_DIR}/nixl"
     meson_args = (
-        f"--prefix={NIXL_INSTALL_PREFIX} --buildtype=release "
+        f"--prefix={nixl_pfx} --buildtype=release "
         f"-Denable_plugins=UCX -Dinstall_headers=true"
     )
     if ucx_path and ucx_path not in ("/usr", "/usr/local"):
@@ -499,10 +760,12 @@ def build_nixl(pod_name, out=None):
         f"chmod -R u+rwx {nixl_src} 2>/dev/null; rm -rf {nixl_src}",
         "clean", _out, timeout=60, ignore_error=True,
     )
+    clone_cmd = _clone_or_download(
+        pod_name, NIXL_REPO, "main", nixl_src, _out)
     steps = [
-        (f"git clone --depth 1 {NIXL_REPO} {nixl_src}", "clone NIXL", 300),
+        (clone_cmd, "clone NIXL", 300),
         (f"cd {nixl_src} && meson setup build {meson_args}",
-         "meson configure", 900),  # downloads abseil subproject
+         "meson configure", 900),
         (f"cd {nixl_src}/build && ninja", "build", 900),
         (f"cd {nixl_src}/build && ninja install", "install", 120),
     ]
@@ -510,52 +773,83 @@ def build_nixl(pod_name, out=None):
         if not _run_build_step(pod_name, cmd, label, _out, timeout=step_timeout):
             return False
 
-    # Configure linker to find NIXL libraries.
-    # Detect actual lib dir: RHEL uses lib64, Debian uses lib/<arch>-linux-gnu
-    ldconfig_cmd = (
-        f'NIXL_LIBDIR=$(find {NIXL_INSTALL_PREFIX} -maxdepth 1 -name "lib*" -type d | head -1) && '
-        f'echo "$NIXL_LIBDIR" > /etc/ld.so.conf.d/nixl.conf && '
-        f'[ -d "$NIXL_LIBDIR/plugins" ] && echo "$NIXL_LIBDIR/plugins" >> /etc/ld.so.conf.d/nixl.conf; '
-        f'ldconfig'
-    )
-    if not _run_build_step(pod_name, ldconfig_cmd, "ldconfig", _out):
-        _out(f"    Warning: ldconfig failed, may need LD_LIBRARY_PATH at runtime.")
+    if not nonroot:
+        # Configure linker to find NIXL libraries (root only)
+        ldconfig_cmd = (
+            f'NIXL_LIBDIR=$(find {nixl_pfx} -maxdepth 1 -name "lib*" -type d | head -1) && '
+            f'echo "$NIXL_LIBDIR" > /etc/ld.so.conf.d/nixl.conf && '
+            f'[ -d "$NIXL_LIBDIR/plugins" ] && echo "$NIXL_LIBDIR/plugins" >> /etc/ld.so.conf.d/nixl.conf; '
+            f'ldconfig'
+        )
+        if not _run_build_step(pod_name, ldconfig_cmd, "ldconfig", _out):
+            _out(f"    Warning: ldconfig failed, may need LD_LIBRARY_PATH at runtime.")
 
-    # Also create symlinks in /usr/local/lib64 (RHEL) or /usr/local/lib as
-    # fallback — ensures the runtime linker finds libs even without ldconfig
-    symlink_cmd = (
-        f'NIXL_LIBDIR=$(find {NIXL_INSTALL_PREFIX} -maxdepth 1 -name "lib*" -type d | head -1) && '
-        f'SYSLIB=$([ -d /usr/local/lib64 ] && echo /usr/local/lib64 || echo /usr/local/lib) && '
-        f'mkdir -p $SYSLIB && '
-        f'for f in $NIXL_LIBDIR/lib*.so*; do '
-        f'  [ -f "$f" ] && ln -sf "$f" $SYSLIB/$(basename "$f") || true; '
-        f'done; '
-        f'for f in $NIXL_LIBDIR/plugins/lib*.so*; do '
-        f'  [ -f "$f" ] && ln -sf "$f" $SYSLIB/$(basename "$f") || true; '
-        f'done; ldconfig'
-    )
-    if not _run_build_step(pod_name, symlink_cmd, "library symlinks", _out):
-        _out(f"    Warning: symlink creation failed.")
+        symlink_cmd = (
+            f'NIXL_LIBDIR=$(find {nixl_pfx} -maxdepth 1 -name "lib*" -type d | head -1) && '
+            f'SYSLIB=$([ -d /usr/local/lib64 ] && echo /usr/local/lib64 || echo /usr/local/lib) && '
+            f'mkdir -p $SYSLIB && '
+            f'for f in $NIXL_LIBDIR/lib*.so*; do '
+            f'  [ -f "$f" ] && ln -sf "$f" $SYSLIB/$(basename "$f") || true; '
+            f'done; '
+            f'for f in $NIXL_LIBDIR/plugins/lib*.so*; do '
+            f'  [ -f "$f" ] && ln -sf "$f" $SYSLIB/$(basename "$f") || true; '
+            f'done; ldconfig'
+        )
+        if not _run_build_step(pod_name, symlink_cmd, "library symlinks", _out):
+            _out(f"    Warning: symlink creation failed.")
+    else:
+        _out(f"    Non-root: skipping ldconfig/symlinks (using LD_LIBRARY_PATH)")
+        # Create lib64 symlink for nixlbench (meson uses libdir=lib64 for find_library)
+        _run_build_step(
+            pod_name,
+            f"rm -rf {nixl_pfx}/lib64 && "
+            f"NIXL_LIBDIR=$(find {nixl_pfx}/lib -maxdepth 2 -name 'libnixl.so' -exec dirname {{}} \\; | head -1) && "
+            f"[ -n \"$NIXL_LIBDIR\" ] && ln -sf \"$NIXL_LIBDIR\" {nixl_pfx}/lib64",
+            "create lib64 symlink", _out, timeout=10, ignore_error=True,
+        )
 
-    _out(f"  NIXL built and installed at {NIXL_INSTALL_PREFIX} on {pod_name}.")
+    _out(f"  NIXL built and installed at {nixl_pfx} on {pod_name}.")
     return True
 
 
 def _build_nixlbench_binary(pod_name, out=None):
     """Build nixlbench binary against installed NIXL."""
     _out = out or print
+    nixl_pfx, bench_pfx, local_pfx = _get_install_prefix(pod_name)
+    nonroot = _detect_nonroot(pod_name)
     _out(f"  Building nixlbench on {pod_name} ...")
 
     nixlbench_src = f"{NIXL_BUILD_DIR}/nixl/benchmark/nixlbench"
-    # Set PKG_CONFIG_PATH so meson finds etcd-cpp-api and other locally-built libs
-    pkg_env = "export PKG_CONFIG_PATH=/usr/local/lib64/pkgconfig:/usr/local/lib/pkgconfig:$PKG_CONFIG_PATH"
+    pkg_env = f"export PKG_CONFIG_PATH={local_pfx}/lib64/pkgconfig:{local_pfx}/lib/pkgconfig:$PKG_CONFIG_PATH"
     meson_args = (
-        f"-Dnixl_path={NIXL_INSTALL_PREFIX}/ "
-        f"-Dprefix={NIXLBENCH_INSTALL_PREFIX} "
-        f"-Detcd_inc_path=/usr/local/include "
-        f"-Detcd_lib_path=/usr/local/lib64 "
+        f"-Dnixl_path={nixl_pfx}/ "
+        f"-Dprefix={bench_pfx} "
+        f"-Dlibdir=lib64 "
+        f"-Detcd_inc_path={local_pfx}/include "
+        f"-Detcd_lib_path={local_pfx}/lib64 "
         f"--buildtype=release"
     )
+
+    # Ensure gflags wrap is available (needed for non-root where system libgflags-dev is missing)
+    if nonroot:
+        _run_build_step(
+            pod_name,
+            f"cd {nixlbench_src} && "
+            f"(test -f subprojects/gflags.wrap || meson wrap install gflags)",
+            "install gflags wrap", _out, timeout=60, ignore_error=True,
+        )
+        # Create etcd include/lib dirs even when empty (meson.build references them unconditionally)
+        exec_in_pod(pod_name, ["bash", "-c", f"mkdir -p {local_pfx}/include {local_pfx}/lib64"], use_debug=False)
+
+    # Patch worker meson.build to add asio_dep (upstream bug: worker includes asio_runtime.h
+    # which needs asio.hpp but asio_dep is not in worker_deps)
+    _run_build_step(
+        pod_name,
+        f"cd {nixlbench_src} && "
+        f"sed -i 's/tomlplusplus_dep$/tomlplusplus_dep,\\n  asio_dep/' src/worker/meson.build",
+        "patch worker deps", _out, timeout=30, ignore_error=True,
+    )
+
     steps = [
         (f"{pkg_env} && cd {nixlbench_src} && meson setup build {meson_args}",
          "meson configure", 300),
@@ -566,25 +860,93 @@ def _build_nixlbench_binary(pod_name, out=None):
         if not _run_build_step(pod_name, cmd, label, _out, timeout=step_timeout):
             return False
 
-    # Add to PATH and LD_LIBRARY_PATH via profile.d for this session
-    env_setup = (
-        f'echo "export PATH={NIXLBENCH_INSTALL_PREFIX}/bin:{NIXL_INSTALL_PREFIX}/bin:\\$PATH" '
-        f'> /etc/profile.d/nixlbench.sh && '
-        f'echo "export LD_LIBRARY_PATH={NIXLBENCH_INSTALL_PREFIX}/lib:'
-        f'{NIXLBENCH_INSTALL_PREFIX}/lib64:'
-        f'{NIXL_INSTALL_PREFIX}/lib64:{NIXL_INSTALL_PREFIX}/lib64/plugins:'
-        f'{NIXL_INSTALL_PREFIX}/lib/\\$(uname -m)-linux-gnu:'
-        f'{NIXL_INSTALL_PREFIX}/lib/\\$(uname -m)-linux-gnu/plugins:'
-        f'/usr/local/lib64:/usr/local/lib:/opt/ucx/lib:'
-        f'\\$LD_LIBRARY_PATH" >> /etc/profile.d/nixlbench.sh && '
-        f'chmod +x /etc/profile.d/nixlbench.sh && '
-        # Also create symlinks in /usr/local/bin for immediate availability
-        f'ln -sf {NIXLBENCH_INSTALL_PREFIX}/bin/nixlbench /usr/local/bin/nixlbench'
-    )
-    if not _run_build_step(pod_name, env_setup, "environment setup", _out):
-        _out(f"    Warning: PATH setup failed. nixlbench may not be found via command -v.")
+    if not nonroot:
+        # Root path: set up profile.d and symlinks
+        env_setup = (
+            f'echo "export PATH={bench_pfx}/bin:{nixl_pfx}/bin:\\$PATH" '
+            f'> /etc/profile.d/nixlbench.sh && '
+            f'echo "export LD_LIBRARY_PATH={bench_pfx}/lib:'
+            f'{bench_pfx}/lib64:'
+            f'{nixl_pfx}/lib64:{nixl_pfx}/lib64/plugins:'
+            f'{nixl_pfx}/lib/\\$(uname -m)-linux-gnu:'
+            f'{nixl_pfx}/lib/\\$(uname -m)-linux-gnu/plugins:'
+            f'/usr/local/lib64:/usr/local/lib:/opt/ucx/lib:'
+            f'\\$LD_LIBRARY_PATH" >> /etc/profile.d/nixlbench.sh && '
+            f'chmod +x /etc/profile.d/nixlbench.sh && '
+            f'ln -sf {bench_pfx}/bin/nixlbench /usr/local/bin/nixlbench'
+        )
+        if not _run_build_step(pod_name, env_setup, "environment setup", _out):
+            _out(f"    Warning: PATH setup failed. nixlbench may not be found via command -v.")
+    else:
+        _out(f"    Non-root: nixlbench installed at {bench_pfx}/bin/ (using LD_LIBRARY_PATH)")
 
-    _out(f"  nixlbench built and installed at {NIXLBENCH_INSTALL_PREFIX} on {pod_name}.")
+    _out(f"  nixlbench built and installed at {bench_pfx} on {pod_name}.")
+    return True
+
+
+def _check_pip_nixl_libs(pod_name):
+    """Check if NIXL libs are available from the pip package."""
+    result = exec_in_pod(
+        pod_name,
+        ["bash", "-c", f"test -f {NIXL_PIP_LIBS}/libnixl.so && echo FOUND"],
+        use_debug=False,
+    )
+    return result.returncode == 0 and "FOUND" in (result.stdout or "")
+
+
+def _setup_pip_nixl_for_build(pod_name, out=None):
+    """Set up NIXL from pip package for building nixlbench against it.
+
+    Creates a fake NIXL install prefix at NONROOT_NIXL_PREFIX with:
+    - lib64/ symlinked to pip package libs (libnixl.so, libnixl_build.so, libserdes.so)
+    - include/ from the cloned NIXL source (src/api/cpp/ headers)
+    """
+    _out = out or print
+    nixl_pfx = NONROOT_NIXL_PREFIX if _detect_nonroot(pod_name) else NIXL_INSTALL_PREFIX
+    nixl_src = f"{NIXL_BUILD_DIR}/nixl"
+
+    _out(f"  Reusing NIXL libs from pip package (nixl_cu12) ...")
+
+    # nixlbench meson.build looks for: nixl_path/include/ and nixl_path/<libdir>/
+    setup_cmd = (
+        f"mkdir -p {nixl_pfx}/lib64 {nixl_pfx}/include && "
+        # Symlink .so files from pip .mesonpy.libs (libnixl.so, libnixl_build.so, libserdes.so etc)
+        f"for f in {NIXL_PIP_LIBS}/lib*.so*; do "
+        f"  [ -f \"$f\" ] && ln -sf \"$f\" {nixl_pfx}/lib64/$(basename \"$f\") || true; "
+        f"done && "
+        # Symlink plugins directory (UCX backend etc)
+        f"ln -sfn {NIXL_PIP_LIBS}/plugins {nixl_pfx}/lib64/plugins && "
+        # Copy API headers from cloned source (nixlbench uses nixl_path/include/)
+        f"cp -r {nixl_src}/src/api/cpp/*.h {nixl_pfx}/include/ 2>/dev/null || true && "
+        # Also copy backend headers if present
+        f"mkdir -p {nixl_pfx}/include/backend && "
+        f"cp -r {nixl_src}/src/api/cpp/backend/*.h {nixl_pfx}/include/backend/ 2>/dev/null || true && "
+        # Copy infra headers (nixl_descriptors.h deps)
+        f"cp -r {nixl_src}/src/infra/*.h {nixl_pfx}/include/ 2>/dev/null || true && "
+        # Copy all internal utility headers recursively (nixlbench uses utils/common/, utils/serdes/ etc)
+        f"cp -a {nixl_src}/src/utils {nixl_pfx}/include/ 2>/dev/null || true && "
+        f"echo DONE"
+    )
+    result = exec_in_pod(pod_name, ["bash", "-c", setup_cmd], timeout=30, use_debug=False)
+    if result.returncode != 0 or "DONE" not in (result.stdout or ""):
+        _out(f"    Warning: failed to set up pip NIXL libs: {(result.stderr or '').strip()[:200]}")
+        return False
+
+    # Verify the critical files
+    verify = exec_in_pod(
+        pod_name,
+        ["bash", "-c",
+         f"test -f {nixl_pfx}/lib64/libnixl.so && "
+         f"test -f {nixl_pfx}/lib64/libnixl_build.so && "
+         f"test -f {nixl_pfx}/lib64/libserdes.so && "
+         f"test -f {nixl_pfx}/include/nixl.h && echo OK"],
+        use_debug=False,
+    )
+    if "OK" not in (verify.stdout or ""):
+        _out(f"    Warning: NIXL prefix verification failed — missing libs or headers")
+        return False
+
+    _out(f"    NIXL prefix set up at {nixl_pfx} (libs from pip, headers from source)")
     return True
 
 
@@ -592,6 +954,7 @@ def build_nixlbench_from_source(pod_name, out=None):
     """Full build pipeline: deps -> etcd-cpp-api -> NIXL -> nixlbench."""
     _out = out or print
     _out(f"  === Building nixlbench from source on {pod_name} ===")
+    nonroot = _detect_nonroot(pod_name)
 
     # Ensure build directory exists
     exec_in_pod(pod_name, ["mkdir", "-p", NIXL_BUILD_DIR], use_debug=False)
@@ -600,12 +963,33 @@ def build_nixlbench_from_source(pod_name, out=None):
     if not install_nixlbench_deps(pod_name, out=_out):
         return False
 
+    # Step 1.5: Create git stub if git is not available (meson needs it for version info)
+    if nonroot:
+        exec_in_pod(
+            pod_name,
+            ["bash", "-c",
+             f"mkdir -p {NONROOT_BIN} && "
+             f"if ! command -v git >/dev/null 2>&1; then "
+             f"cat > {NONROOT_BIN}/git << 'GITEOF'\n"
+             "#!/bin/bash\n"
+             "if [[ \"$*\" == *\"rev-parse\"* ]]; then echo \"00000000\"; exit 0; "
+             "elif [[ \"$*\" == *\"describe\"* ]]; then echo \"v0.0.0\"; exit 0; "
+             "elif [[ \"$*\" == *\"submodule\"* ]]; then exit 0; "
+             "elif [[ \"$*\" == *\"clone\"* ]]; then echo \"git stub: clone not supported\" >&2; exit 1; "
+             "else exit 0; fi\n"
+             f"GITEOF\n"
+             f"chmod +x {NONROOT_BIN}/git; fi"],
+            use_debug=False,
+        )
+
     # Step 2: Build etcd-cpp-apiv3 (optional but needed for multi-node)
     etcd_ok = build_etcd_cpp_api(pod_name, out=_out)
     if not etcd_ok:
         _out(f"  Continuing without etcd-cpp-apiv3 (nixlbench etcd runtime will be disabled).")
 
-    # Step 3: Build NIXL library
+    # Step 3: Build NIXL from source (full build for consistent headers + libs)
+    # Note: pip NIXL libs have version mismatches with the public source headers,
+    # so we always do a full build from source for ABI compatibility.
     if not build_nixl(pod_name, out=_out):
         _out(f"  NIXL build failed. Cannot continue.")
         return False
@@ -636,18 +1020,20 @@ def install_etcd(pod_name, out=None):
         _out(f"  Re-run with --install-deps to automatically install etcd.")
         sys.exit(1)
 
-    _out(f"  Installing etcd {ETCD_VER} on {pod_name} ...")
+    bin_dir = _get_bin_dir(pod_name)
+    _out(f"  Installing etcd {ETCD_VER} on {pod_name} (to {bin_dir}) ...")
     install_script = (
+        f'mkdir -p {bin_dir} && '
         f'curl -L {ETCD_DOWNLOAD_URL} -o /tmp/etcd.tar.gz'
         f' && tar xzf /tmp/etcd.tar.gz -C /tmp'
-        f' && cp /tmp/etcd-{ETCD_VER}-linux-amd64/etcd /usr/local/bin/'
-        f' && cp /tmp/etcd-{ETCD_VER}-linux-amd64/etcdctl /usr/local/bin/'
+        f' && cp /tmp/etcd-{ETCD_VER}-linux-amd64/etcd {bin_dir}/'
+        f' && cp /tmp/etcd-{ETCD_VER}-linux-amd64/etcdctl {bin_dir}/'
         f' && rm -rf /tmp/etcd*'
         f' && echo "ETCD_INSTALLED"'
     )
     result = exec_in_pod(pod_name, ["bash", "-c", install_script], timeout=120, use_debug=False)
     if result.returncode != 0 or "ETCD_INSTALLED" not in result.stdout:
-        _out(f"  Error: failed to install etcd: {result.stderr.strip()[:200]}")
+        _out(f"  Error: failed to install etcd: {(result.stderr or result.stdout or '').strip()[:200]}")
         return False
     _out(f"  etcd {ETCD_VER} installed on {pod_name}.")
     return True
@@ -661,13 +1047,16 @@ def start_etcd_server(pod_name, pod_ip, out=None):
     _out = out or print
     _c = _get_common()
 
+    bin_dir = _get_bin_dir(pod_name)
     etcd_args = [
-        "etcd",
-        "--data-dir=/tmp/etcd-nixlbench-data",
-        f"--listen-client-urls=http://0.0.0.0:{ETCD_PORT}",
-        f"--advertise-client-urls=http://{pod_ip}:{ETCD_PORT}",
-        f"--listen-peer-urls=http://0.0.0.0:2380",
-        f"--initial-advertise-peer-urls=http://{pod_ip}:2380",
+        "bash", "-c",
+        f"export PATH={bin_dir}:/usr/local/bin:$PATH && "
+        f"etcd "
+        f"--data-dir=/tmp/etcd-nixlbench-data "
+        f"--listen-client-urls=http://0.0.0.0:{ETCD_PORT} "
+        f"--advertise-client-urls=http://{pod_ip}:{ETCD_PORT} "
+        f"--listen-peer-urls=http://0.0.0.0:2380 "
+        f"--initial-advertise-peer-urls=http://{pod_ip}:2380 "
         f"--initial-cluster=default=http://{pod_ip}:2380",
     ]
     cmd = _c._build_remote_cmd(pod_name, etcd_args)
@@ -683,7 +1072,9 @@ def start_etcd_server(pod_name, pod_ip, out=None):
     time.sleep(2)
     health_result = exec_in_pod(
         pod_name,
-        ["etcdctl", "endpoint", "health", f"--endpoints=http://localhost:{ETCD_PORT}"],
+        ["bash", "-c",
+         f"export PATH={bin_dir}:/usr/local/bin:$PATH && "
+         f"etcdctl endpoint health --endpoints=http://localhost:{ETCD_PORT}"],
         use_debug=False,
     )
     if health_result.returncode != 0:
@@ -718,7 +1109,9 @@ def cleanup_etcd_state(pod_name, etcd_endpoint, group=None, out=None):
     prefix = f"xferbench/{group}" if group else "xferbench"
     exec_in_pod(
         pod_name,
-        ["etcdctl", "del", prefix, "--prefix=true", f"--endpoints={etcd_endpoint}"],
+        ["bash", "-c",
+         f"export PATH={NONROOT_BIN}:/usr/local/bin:$PATH && "
+         f"etcdctl del {prefix} --prefix=true --endpoints={etcd_endpoint}"],
         use_debug=False,
     )
     if _get_common().VERBOSE:
@@ -728,60 +1121,121 @@ def cleanup_etcd_state(pod_name, etcd_endpoint, group=None, out=None):
 # ---------------------------------------------------------------------------
 # NIXLBench execution
 # ---------------------------------------------------------------------------
-def _build_nixlbench_cmd(etcd_endpoint, benchmark_group):
-    """Build full shell command for nixlbench with proper PATH/LD_LIBRARY_PATH."""
-    # Convert buffer size to raw bytes (nixlbench expects uint64, not "8G")
-    buffer_bytes = _get_common()._parse_size(NIXLBENCH_BUFFER_SIZE)
-    nixl_args = (
-        f"--etcd_endpoints {etcd_endpoint} "
-        f"--benchmark_group {benchmark_group} "
-        f"--backend {NIXLBENCH_BACKEND} "
-        f"--initiator_seg_type {NIXLBENCH_SEG_TYPE} "
-        f"--target_seg_type {NIXLBENCH_SEG_TYPE} "
-        f"--op_type WRITE "
-        f"--total_buffer_size {buffer_bytes}"
+NIXLBENCH_ASIO_PORT = 12345
+
+
+def _check_etcd_in_binary(pod_name):
+    """Check if nixlbench was built with working etcd runtime (not just listed in help)."""
+    nixl_pfx, bench_pfx, _local_pfx = _get_install_prefix(pod_name)
+    nonroot_pfx = _nonroot_env_prefix(pod_name)
+    env_prefix = (
+        f'{nonroot_pfx}'
+        f'export PATH={bench_pfx}/bin:{nixl_pfx}/bin:'
+        f'{NONROOT_BIN}:/usr/local/bin:$PATH && '
+        f'export LD_LIBRARY_PATH={bench_pfx}/lib:'
+        f'{bench_pfx}/lib64:'
+        f'{nixl_pfx}/lib64:{nixl_pfx}/lib64/plugins:'
+        f'{nixl_pfx}/lib/$(uname -m)-linux-gnu:'
+        f'{NIXL_PIP_LIBS}:{NIXL_PIP_UCX_LIBS}:'
+        f'/opt/ucx/lib:/usr/local/lib64:/usr/local/lib:${{LD_LIBRARY_PATH:-}}'
     )
-    # Wrap in bash to set PATH/LD_LIBRARY_PATH for built-from-source installs
-    # Include both lib64 (RHEL) and lib/<arch>-linux-gnu (Debian) paths
+    result = exec_in_pod(
+        pod_name,
+        ["bash", "-c",
+         f'{env_prefix} && nixlbench --etcd_endpoints http://127.0.0.1:1 '
+         f'--benchmark_group test 2>&1 | head -5'],
+        timeout=10, use_debug=False,
+    )
+    output = (result.stdout or "") + (result.stderr or "")
+    return "Invalid runtime" not in output
+
+
+def _build_nixlbench_cmd(etcd_endpoint, benchmark_group, pod_name=None,
+                         runtime_type=None, asio_address=None):
+    """Build full shell command for nixlbench with proper PATH/LD_LIBRARY_PATH."""
+    buffer_bytes = _get_common()._parse_size(NIXLBENCH_BUFFER_SIZE)
+
+    if runtime_type == "ASIO":
+        nixl_args = (
+            f"-runtime_type ASIO "
+            f"-asio_address {asio_address or '127.0.0.1'} "
+            f"-asio_port {NIXLBENCH_ASIO_PORT} "
+            f"--backend {NIXLBENCH_BACKEND} "
+            f"--initiator_seg_type {NIXLBENCH_SEG_TYPE} "
+            f"--target_seg_type {NIXLBENCH_SEG_TYPE} "
+            f"--op_type WRITE "
+            f"--total_buffer_size {buffer_bytes}"
+        )
+    else:
+        nixl_args = (
+            f"--etcd_endpoints {etcd_endpoint} "
+            f"--benchmark_group {benchmark_group} "
+            f"--backend {NIXLBENCH_BACKEND} "
+            f"--initiator_seg_type {NIXLBENCH_SEG_TYPE} "
+            f"--target_seg_type {NIXLBENCH_SEG_TYPE} "
+            f"--op_type WRITE "
+            f"--total_buffer_size {buffer_bytes}"
+        )
+    # Include both standard and non-root paths for maximum compatibility
     env_setup = (
-        f"export PATH={NIXLBENCH_INSTALL_PREFIX}/bin:{NIXL_INSTALL_PREFIX}/bin:"
+        f"export HOME=/tmp && "
+        f"export PATH={NONROOT_NIXLBENCH_PREFIX}/bin:{NONROOT_NIXL_PREFIX}/bin:"
+        f"{NONROOT_BIN}:"
+        f"{NIXLBENCH_INSTALL_PREFIX}/bin:{NIXL_INSTALL_PREFIX}/bin:"
         f"/usr/local/bin:$PATH && "
-        f"export LD_LIBRARY_PATH={NIXLBENCH_INSTALL_PREFIX}/lib:"
-        f"{NIXLBENCH_INSTALL_PREFIX}/lib64:"
-        f"{NIXL_INSTALL_PREFIX}/lib64:"
-        f"{NIXL_INSTALL_PREFIX}/lib64/plugins:"
+        f"export LD_LIBRARY_PATH={NONROOT_NIXLBENCH_PREFIX}/lib:"
+        f"{NONROOT_NIXLBENCH_PREFIX}/lib64:"
+        f"{NONROOT_NIXL_PREFIX}/lib64:{NONROOT_NIXL_PREFIX}/lib64/plugins:"
+        f"{NONROOT_NIXL_PREFIX}/lib/$(uname -m)-linux-gnu:"
+        f"{NONROOT_NIXL_PREFIX}/lib/$(uname -m)-linux-gnu/plugins:"
+        f"{NONROOT_PREFIX}/lib64:{NONROOT_PREFIX}/lib:"
+        f"{NIXL_PIP_LIBS}:{NIXL_PIP_UCX_LIBS}:"
+        f"{NIXLBENCH_INSTALL_PREFIX}/lib:{NIXLBENCH_INSTALL_PREFIX}/lib64:"
+        f"{NIXL_INSTALL_PREFIX}/lib64:{NIXL_INSTALL_PREFIX}/lib64/plugins:"
         f"{NIXL_INSTALL_PREFIX}/lib/$(uname -m)-linux-gnu:"
         f"{NIXL_INSTALL_PREFIX}/lib/$(uname -m)-linux-gnu/plugins:"
-        f"/opt/ucx/lib:/usr/local/lib64:/usr/local/lib:$LD_LIBRARY_PATH"
+        f"/opt/ucx/lib:/usr/local/lib64:/usr/local/lib:${{LD_LIBRARY_PATH:-}}"
     )
     return ["bash", "-c", f"{env_setup} && {NIXLBENCH_BINARY} {nixl_args}"]
 
 
-def run_nixlbench_pair(src_pod, src_ip, dst_pod, dst_ip, etcd_endpoint, group, out=None):
+def run_nixlbench_pair(src_pod, src_ip, dst_pod, dst_ip, etcd_endpoint, group,
+                       out=None, use_asio=False):
     """Run nixlbench between two pods. Returns parsed metrics dict or None.
 
     Launches target first (Popen), then initiator (subprocess.run blocking).
-    Both self-register via etcd to get ranks.
+    When use_asio=True, uses direct ASIO socket communication (no etcd needed).
+    Otherwise uses etcd for rank coordination.
     """
     _out = out or print
     _c = _get_common()
 
-    nixl_cmd_args = _build_nixlbench_cmd(etcd_endpoint, group)
-    short_desc = f"nixlbench --backend {NIXLBENCH_BACKEND} --benchmark_group {group}"
+    if use_asio:
+        # ASIO: both use dst_ip as address. First to start binds (rank 0),
+        # second fails bind and connects (rank 1). Target starts first.
+        target_cmd_args = _build_nixlbench_cmd(
+            etcd_endpoint, group, runtime_type="ASIO", asio_address=dst_ip)
+        initiator_cmd_args = _build_nixlbench_cmd(
+            etcd_endpoint, group, runtime_type="ASIO", asio_address=dst_ip)
+        short_desc = f"nixlbench --backend {NIXLBENCH_BACKEND} -runtime_type ASIO"
+    else:
+        target_cmd_args = _build_nixlbench_cmd(etcd_endpoint, group)
+        initiator_cmd_args = _build_nixlbench_cmd(etcd_endpoint, group)
+        short_desc = f"nixlbench --backend {NIXLBENCH_BACKEND} --benchmark_group {group}"
 
     # Start target (background)
-    target_cmd = _c._build_remote_cmd(dst_pod, nixl_cmd_args)
+    target_cmd = _c._build_remote_cmd(dst_pod, target_cmd_args)
     _out(f"  Target: {short_desc}")
     if _c.VERBOSE:
         _out(f"  $ {' '.join(target_cmd)}")
     target_proc = subprocess.Popen(target_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     _c._server_procs_append(target_proc)
 
-    # Brief delay for target to register with etcd
-    time.sleep(2)
+    # Brief delay for target to start listening
+    time.sleep(3 if use_asio else 2)
 
     # Start initiator (blocking)
-    initiator_cmd = _c._build_remote_cmd(src_pod, nixl_cmd_args)
+    initiator_cmd = _c._build_remote_cmd(src_pod, initiator_cmd_args)
     _out(f"  Initiator: {short_desc}")
     if _c.VERBOSE:
         _out(f"  $ {' '.join(initiator_cmd)}")
@@ -813,8 +1267,9 @@ def run_nixlbench_pair(src_pod, src_ip, dst_pod, dst_ip, etcd_endpoint, group, o
         target_out = target_stdout.decode("utf-8", errors="replace") if isinstance(target_stdout, bytes) else target_stdout
         _out(f"  nixlbench target output ({len(target_out)} chars):\n{target_out[-2000:]}")
 
-    # Clean up etcd state for this group
-    cleanup_etcd_state(_etcd_pod_name, etcd_endpoint, group=group, out=_out)
+    # Clean up etcd state for this group (only when using etcd runtime)
+    if not use_asio:
+        cleanup_etcd_state(_etcd_pod_name, etcd_endpoint, group=group, out=_out)
 
     if result is None or result.returncode != 0:
         stderr_msg = result.stderr.strip()[:200] if result else "timeout"
@@ -932,7 +1387,7 @@ def parse_nixlbench_output(stdout, out=None):
     return metrics
 
 
-def _run_nixlbench_matrix(pods, display_names, etcd_endpoint):
+def _run_nixlbench_matrix(pods, display_names, etcd_endpoint, use_asio=False):
     """Run nixlbench for all pod pairs. Returns dict of metric_name -> NxN matrix."""
     _c = _get_common()
     n = len(pods)
@@ -981,6 +1436,7 @@ def _run_nixlbench_matrix(pods, display_names, etcd_endpoint):
                 pair_metrics = run_nixlbench_pair(
                     src_name, src_ip, dst_name, dst_ip,
                     etcd_endpoint, group, out=_out,
+                    use_asio=use_asio,
                 )
                 if pair_metrics:
                     for k, v in pair_metrics.items():
@@ -1104,22 +1560,29 @@ def run_nixlbench(pods, display_names):
         print(f"\n  Aborting: nixlbench not available on {', '.join(failed_pods)}")
         return {}
 
-    # --- Step 2: Install/verify etcd on pod 0 ---
+    # --- Step 2: Detect runtime mode (ASIO if etcd support not compiled in) ---
     etcd_pod_name, etcd_pod_ip = pods[0]
     _etcd_pod_name = etcd_pod_name
-    print(f"\nSetting up etcd on {display_names[etcd_pod_name]} ...")
-    install_etcd(etcd_pod_name)
-
-    # --- Step 3: Start etcd server ---
-    etcd_proc = start_etcd_server(etcd_pod_name, etcd_pod_ip)
-    etcd_endpoint = f"http://{etcd_pod_ip}:{ETCD_PORT}"
+    use_asio = not _check_etcd_in_binary(etcd_pod_name)
+    if use_asio:
+        print(f"\n  Using ASIO runtime (nixlbench built without etcd-cpp-api)")
+        etcd_endpoint = ""
+        etcd_proc = None
+    else:
+        print(f"\nSetting up etcd on {display_names[etcd_pod_name]} ...")
+        install_etcd(etcd_pod_name)
+        # --- Step 3: Start etcd server ---
+        etcd_proc = start_etcd_server(etcd_pod_name, etcd_pod_ip)
+        etcd_endpoint = f"http://{etcd_pod_ip}:{ETCD_PORT}"
 
     try:
         # --- Step 4: Run nixlbench matrix ---
-        results = _run_nixlbench_matrix(pods, display_names, etcd_endpoint)
+        results = _run_nixlbench_matrix(pods, display_names, etcd_endpoint,
+                                        use_asio=use_asio)
     finally:
         # --- Step 5: Stop etcd ---
-        stop_etcd_server(etcd_proc)
+        if etcd_proc:
+            stop_etcd_server(etcd_proc)
 
     return results
 
@@ -1161,9 +1624,9 @@ Options:
 
     _c = _get_common()
     _cfg = _c._parse_common_args(extra_flags={
-        ("--nixlbench-backend",):       ("_NIXLBENCH_BACKEND", True),
-        ("--nixlbench-seg-type",):      ("_NIXLBENCH_SEG_TYPE", True),
-        ("--nixlbench-buffer-size",):   ("_NIXLBENCH_BUFFER_SIZE", True),
+        ("--nixlbench-backend", "--nixlbench-backend"):       ("_NIXLBENCH_BACKEND", True),
+        ("--nixlbench-seg-type", "--nixlbench-seg-type"):     ("_NIXLBENCH_SEG_TYPE", True),
+        ("--nixlbench-buffer-size", "--nixlbench-buffer-size"): ("_NIXLBENCH_BUFFER_SIZE", True),
     })
 
     # Apply nixlbench-specific config
