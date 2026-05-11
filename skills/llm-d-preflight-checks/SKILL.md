@@ -21,6 +21,175 @@ When in `pause` mode, the HTTP server satisfies K8s health probes and provides:
 
 The script must be mounted into llm-d pods. To do this, create a ConfigMap with the script and mount it as a volume in the deployment. Then, modify the entrypoint of the container to run the preflight check script before starting vLLM.
 
+## Running preflight checks with llm-d quickstart
+
+Follow the [llm-d quickstart guide](https://llm-d.ai/docs/getting-started/quickstart) to deploy llm-d, then patch the model server deployment to run the preflight checks script before vLLM starts.
+
+### Prerequisites
+
+- llm-d deployed via the quickstart guide (Helm chart + model server kustomization)
+- A clone of `llm-d-pd-utils` containing the preflight checks script at `scripts/llm-d-preflight-checks.py` (or the skill directory at `.claude/skills/llm-d-preflight-checks/scripts/llm-d-preflight-checks.py`)
+
+### Step 1: Deploy llm-d via quickstart
+
+```bash
+cd /path/to/llm-d
+export GAIE_VERSION=v1.5.0
+export GUIDE_NAME="quickstart"
+export NAMESPACE=<your-namespace>
+
+# Install CRDs
+kubectl apply -k "https://github.com/kubernetes-sigs/gateway-api-inference-extension/config/crd?ref=${GAIE_VERSION}"
+kubectl create namespace ${NAMESPACE}
+
+# Deploy router
+helm install ${GUIDE_NAME} \
+    oci://registry.k8s.io/gateway-api-inference-extension/charts/standalone \
+    -f guides/recipes/scheduler/base.values.yaml \
+    -f guides/optimized-baseline/scheduler/optimized-baseline.values.yaml \
+    -n ${NAMESPACE} --version ${GAIE_VERSION}
+
+# Deploy model server
+kubectl apply -n ${NAMESPACE} -k guides/optimized-baseline/modelserver/gpu/vllm/base/
+```
+
+### Step 2: Create a ConfigMap with the preflight checks script
+
+```bash
+kubectl create configmap llm-d-preflight-checks \
+  --from-file=llm-d-preflight-checks.py=/path/to/llm-d-pd-utils/.claude/skills/llm-d-preflight-checks/scripts/llm-d-preflight-checks.py \
+  -n ${NAMESPACE}
+```
+
+### Step 3: Patch the model server deployment
+
+Apply a JSON patch to the deployment that:
+1. Adds a volume from the ConfigMap
+2. Mounts the script at `/preflight/llm-d-preflight-checks.py`
+3. Sets `LLMD_PREFLIGHT_CHECKS=pause` (or another mode)
+4. Changes the entrypoint to run the preflight script before vLLM via `&&`
+
+```bash
+kubectl patch deployment optimized-baseline-nvidia-gpu-vllm-decode \
+  -n ${NAMESPACE} --type=json -p '[
+  {
+    "op": "add",
+    "path": "/spec/template/spec/volumes/-",
+    "value": {
+      "name": "preflight-checks",
+      "configMap": {
+        "name": "llm-d-preflight-checks",
+        "defaultMode": 493
+      }
+    }
+  },
+  {
+    "op": "add",
+    "path": "/spec/template/spec/containers/0/volumeMounts/-",
+    "value": {
+      "name": "preflight-checks",
+      "mountPath": "/preflight"
+    }
+  },
+  {
+    "op": "add",
+    "path": "/spec/template/spec/containers/0/env",
+    "value": [
+      {
+        "name": "LLMD_PREFLIGHT_CHECKS",
+        "value": "pause"
+      }
+    ]
+  },
+  {
+    "op": "replace",
+    "path": "/spec/template/spec/containers/0/command",
+    "value": ["bash", "-c"]
+  },
+  {
+    "op": "replace",
+    "path": "/spec/template/spec/containers/0/args",
+    "value": [
+      "python3 /preflight/llm-d-preflight-checks.py && vllm serve Qwen/Qwen3-32B --disable-access-log-for-endpoints=/health,/metrics,/v1/models --tensor-parallel-size=2 --gpu-memory-utilization=0.95"
+    ]
+  }
+]'
+```
+
+This triggers a rolling update. New pods will start the preflight script, which prints system diagnostics (environment variables, GPU topology via `nvidia-smi topo -m`, NVLink status, CPU info via `lscpu`) and then — in `pause` mode — starts an HTTP server on port 8000 that satisfies K8s health probes (`/health` returns 200) while blocking vLLM startup.
+
+The `&&` between the preflight script and `vllm serve` ensures vLLM only starts if the preflight script exits with code 0.
+
+### Step 4: Verify the preflight checks are running
+
+Wait for the rolling update to complete and check pod logs:
+
+```bash
+# Check pods are Running and Ready (preflight HTTP server satisfies probes)
+kubectl get pods -n ${NAMESPACE} -l llm-d.ai/model=Qwen3-32B
+
+# Verify the preflight script started
+kubectl logs -n ${NAMESPACE} <pod-name> | grep "llm-d-preflight-checks.py starting"
+
+# Verify pause mode is active
+kubectl logs -n ${NAMESPACE} <pod-name> | grep "LLMD_PREFLIGHT_CHECKS"
+
+# Test the preflight HTTP endpoints
+kubectl exec -n ${NAMESPACE} <pod-name> -- curl -s http://localhost:8000/health
+# Returns: {"status":"ok"}
+
+kubectl exec -n ${NAMESPACE} <pod-name> -- curl -s http://localhost:8000/info
+# Returns: full system diagnostics (env, GPU topology, NVLink, lscpu)
+```
+
+### Step 5: Resume vLLM startup
+
+When ready to let vLLM start (after inspecting diagnostics or running network tests), call `/exit` on each pod:
+
+```bash
+# Resume all pods matching the label
+for pod in $(kubectl get pods -n ${NAMESPACE} -l llm-d.ai/model=Qwen3-32B -o name); do
+  kubectl exec -n ${NAMESPACE} $pod -- curl -s http://localhost:8000/exit
+done
+```
+
+After `/exit` is called, the preflight server shuts down, the script exits with code 0, and `vllm serve` starts normally.
+
+### How it works
+
+The patch modifies the pod spec as follows:
+
+| Original | Patched |
+|----------|---------|
+| `command: ["vllm", "serve"]` | `command: ["bash", "-c"]` |
+| `args: ["Qwen/Qwen3-32B", ...]` | `args: ["python3 /preflight/llm-d-preflight-checks.py && vllm serve Qwen/Qwen3-32B ..."]` |
+| No ConfigMap volume | ConfigMap `llm-d-preflight-checks` mounted at `/preflight` (mode 0755) |
+| No env vars | `LLMD_PREFLIGHT_CHECKS=pause` |
+
+The ConfigMap volume (`defaultMode: 493` = octal `0755`) ensures the script is executable. The `bash -c` wrapper allows the `&&` chain to work: preflight runs first, and only if it exits 0 does vLLM start.
+
+In `pause` mode, the preflight HTTP server binds to port 8000 (the same port vLLM would use), so K8s startup/liveness/readiness probes pass while vLLM is not yet running. Once `/exit` is called, the server releases port 8000 and vLLM binds to it normally.
+
+### Changing preflight mode without redeployment
+
+To switch from `pause` to a non-blocking mode (e.g., diagnostics-only), patch just the env var:
+
+```bash
+kubectl set env deployment/optimized-baseline-nvidia-gpu-vllm-decode \
+  -n ${NAMESPACE} LLMD_PREFLIGHT_CHECKS=none
+```
+
+This triggers a new rollout where the preflight script prints diagnostics and exits immediately, allowing vLLM to start without manual intervention.
+
+### Cleanup
+
+To remove preflight checks entirely, redeploy the original model server kustomization:
+
+```bash
+kubectl apply -n ${NAMESPACE} -k /path/to/llm-d/guides/optimized-baseline/modelserver/gpu/vllm/base/
+kubectl delete configmap llm-d-preflight-checks -n ${NAMESPACE}
+```
+
 ## Running preflight checks with llm-d-benchmark
 
 The [llm-d-benchmark](https://github.com/llm-d/llm-d-benchmark) framework can run the preflight checks script automatically before vLLM starts. The framework's step 04 (`04_ensure_model_namespace_prepared.py`) reads all files from `setup/preprocess/` into a ConfigMap named `llm-d-benchmark-preprocesses`, which gets mounted at `/setup/preprocess/` inside pods.
