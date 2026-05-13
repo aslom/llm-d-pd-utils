@@ -190,6 +190,220 @@ kubectl apply -n ${NAMESPACE} -k /path/to/llm-d/guides/optimized-baseline/models
 kubectl delete configmap llm-d-preflight-checks -n ${NAMESPACE}
 ```
 
+## Running preflight checks with P/D disaggregation guide
+
+Follow the [P/D disaggregation guide](https://github.com/llm-d/llm-d/tree/main/guides/pd-disaggregation) to deploy llm-d with separate prefill and decode instances, then patch both deployments to run preflight checks before vLLM starts.
+
+The P/D disaggregation guide deploys **two** model server deployments (prefill and decode) with different configurations:
+
+| | Prefill | Decode |
+|---|---------|--------|
+| Replicas | 8 | 2 |
+| Tensor parallel | TP=1 | TP=4 |
+| vLLM port | 8000 | 8200 |
+| Pod label | `llm-d.ai/role=prefill` | `llm-d.ai/role=decode` |
+
+### Prerequisites
+
+- llm-d deployed via the P/D disaggregation guide
+- A clone of `llm-d-pd-utils` containing the preflight checks script
+
+### Step 1: Deploy llm-d via the P/D disaggregation guide
+
+```bash
+cd /path/to/llm-d
+export GAIE_VERSION=v1.5.0
+export GUIDE_NAME="pd-disaggregation"
+export NAMESPACE="llm-d-pd-disaggregation"
+
+# Install CRDs
+kubectl apply -k "https://github.com/kubernetes-sigs/gateway-api-inference-extension/config/crd?ref=${GAIE_VERSION}"
+kubectl create namespace ${NAMESPACE}
+
+# Deploy router
+helm install ${GUIDE_NAME} \
+    oci://registry.k8s.io/gateway-api-inference-extension/charts/standalone \
+    -f guides/recipes/scheduler/base.values.yaml \
+    -f guides/${GUIDE_NAME}/scheduler/${GUIDE_NAME}.values.yaml \
+    -n ${NAMESPACE} --version ${GAIE_VERSION}
+
+# Deploy model server (prefill + decode)
+kubectl apply -n ${NAMESPACE} -k guides/${GUIDE_NAME}/modelserver/gpu/vllm/base
+```
+
+### Step 2: Create a ConfigMap with the preflight checks script
+
+```bash
+kubectl create configmap llm-d-preflight-checks \
+  --from-file=llm-d-preflight-checks.py=/path/to/llm-d-pd-utils/.claude/skills/llm-d-preflight-checks/scripts/llm-d-preflight-checks.py \
+  -n ${NAMESPACE}
+```
+
+### Step 3: Patch the prefill deployment
+
+The prefill pods use port 8000 (same as the quickstart), so the preflight script works without any port override:
+
+```bash
+kubectl patch deployment pd-disaggregation-nvidia-gpu-vllm-prefill \
+  -n ${NAMESPACE} --type=json -p '[
+  {
+    "op": "add",
+    "path": "/spec/template/spec/volumes/-",
+    "value": {
+      "name": "preflight-checks",
+      "configMap": {
+        "name": "llm-d-preflight-checks",
+        "defaultMode": 493
+      }
+    }
+  },
+  {
+    "op": "add",
+    "path": "/spec/template/spec/containers/0/volumeMounts/-",
+    "value": {
+      "name": "preflight-checks",
+      "mountPath": "/preflight"
+    }
+  },
+  {
+    "op": "add",
+    "path": "/spec/template/spec/containers/0/env",
+    "value": [
+      {
+        "name": "LLMD_PREFLIGHT_CHECKS",
+        "value": "pause"
+      }
+    ]
+  },
+  {
+    "op": "replace",
+    "path": "/spec/template/spec/containers/0/command",
+    "value": ["bash", "-c"]
+  },
+  {
+    "op": "replace",
+    "path": "/spec/template/spec/containers/0/args",
+    "value": [
+      "python3 /preflight/llm-d-preflight-checks.py && vllm serve openai/gpt-oss-120b --disable-access-log-for-endpoints=/health,/metrics,/v1/models --tensor-parallel-size=1 --block-size=128 --gpu-memory-utilization=0.9"
+    ]
+  }
+]'
+```
+
+### Step 4: Patch the decode deployment
+
+The decode pods use **port 8200** for vLLM. The preflight script reads `VLLM_INFERENCE_PORT` to determine which port to bind its HTTP server to, so we set that env var in the patch:
+
+```bash
+kubectl patch deployment pd-disaggregation-nvidia-gpu-vllm-decode \
+  -n ${NAMESPACE} --type=json -p '[
+  {
+    "op": "add",
+    "path": "/spec/template/spec/volumes/-",
+    "value": {
+      "name": "preflight-checks",
+      "configMap": {
+        "name": "llm-d-preflight-checks",
+        "defaultMode": 493
+      }
+    }
+  },
+  {
+    "op": "add",
+    "path": "/spec/template/spec/containers/0/volumeMounts/-",
+    "value": {
+      "name": "preflight-checks",
+      "mountPath": "/preflight"
+    }
+  },
+  {
+    "op": "add",
+    "path": "/spec/template/spec/containers/0/env",
+    "value": [
+      {
+        "name": "LLMD_PREFLIGHT_CHECKS",
+        "value": "pause"
+      },
+      {
+        "name": "VLLM_INFERENCE_PORT",
+        "value": "8200"
+      }
+    ]
+  },
+  {
+    "op": "replace",
+    "path": "/spec/template/spec/containers/0/command",
+    "value": ["bash", "-c"]
+  },
+  {
+    "op": "replace",
+    "path": "/spec/template/spec/containers/0/args",
+    "value": [
+      "python3 /preflight/llm-d-preflight-checks.py && vllm serve openai/gpt-oss-120b --disable-access-log-for-endpoints=/health,/metrics,/v1/models --tensor-parallel-size=4 --gpu-memory-utilization=0.95 --port 8200"
+    ]
+  }
+]'
+```
+
+The `VLLM_INFERENCE_PORT=8200` env var tells the preflight script to bind its HTTP server on port 8200, which is the port K8s health probes target on decode pods.
+
+### Step 5: Verify the preflight checks are running
+
+```bash
+# Check prefill pods
+kubectl get pods -n ${NAMESPACE} -l llm-d.ai/role=prefill
+
+# Check decode pods
+kubectl get pods -n ${NAMESPACE} -l llm-d.ai/role=decode
+
+# Verify preflight started on a prefill pod
+kubectl logs -n ${NAMESPACE} <prefill-pod> | grep "llm-d-preflight-checks.py starting"
+
+# Verify preflight started on a decode pod
+kubectl logs -n ${NAMESPACE} <decode-pod> | grep "llm-d-preflight-checks.py starting"
+
+# Test preflight HTTP endpoints (prefill uses port 8000)
+kubectl exec -n ${NAMESPACE} <prefill-pod> -- curl -s http://localhost:8000/health
+
+# Test preflight HTTP endpoints (decode uses port 8200)
+kubectl exec -n ${NAMESPACE} <decode-pod> -- curl -s http://localhost:8200/health
+```
+
+### Step 6: Resume vLLM startup
+
+When ready to let vLLM start, call `/exit` on each pod. Resume prefill and decode separately:
+
+```bash
+# Resume all prefill pods
+for pod in $(kubectl get pods -n ${NAMESPACE} -l llm-d.ai/role=prefill -o name); do
+  kubectl exec -n ${NAMESPACE} $pod -- curl -s http://localhost:8000/exit
+done
+
+# Resume all decode pods
+for pod in $(kubectl get pods -n ${NAMESPACE} -l llm-d.ai/role=decode -o name); do
+  kubectl exec -n ${NAMESPACE} $pod -- curl -s http://localhost:8200/exit
+done
+```
+
+### Changing preflight mode without redeployment
+
+```bash
+# Switch prefill to non-blocking mode
+kubectl set env deployment/pd-disaggregation-nvidia-gpu-vllm-prefill \
+  -n ${NAMESPACE} LLMD_PREFLIGHT_CHECKS=none
+
+# Switch decode to non-blocking mode
+kubectl set env deployment/pd-disaggregation-nvidia-gpu-vllm-decode \
+  -n ${NAMESPACE} LLMD_PREFLIGHT_CHECKS=none
+```
+
+### Cleanup
+
+```bash
+kubectl apply -n ${NAMESPACE} -k /path/to/llm-d/guides/pd-disaggregation/modelserver/gpu/vllm/base
+kubectl delete configmap llm-d-preflight-checks -n ${NAMESPACE}
+```
+
 ## Running preflight checks with llm-d-benchmark
 
 The [llm-d-benchmark](https://github.com/llm-d/llm-d-benchmark) framework can run the preflight checks script automatically before vLLM starts. The framework's step 04 (`04_ensure_model_namespace_prepared.py`) reads all files from `setup/preprocess/` into a ConfigMap named `llm-d-benchmark-preprocesses`, which gets mounted at `/setup/preprocess/` inside pods.
